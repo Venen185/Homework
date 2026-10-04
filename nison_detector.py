@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Callable
@@ -55,9 +56,15 @@ def _iss_get(path: str, params: dict) -> dict:
     import requests
 
     params = {"iss.meta": "off", **params}
-    r = requests.get(f"{ISS}/{path}", params=params, timeout=30)
-    r.raise_for_status()
-    return r.json()
+    for attempt in range(4):
+        try:
+            r = requests.get(f"{ISS}/{path}", params=params, timeout=30)
+            r.raise_for_status()
+            return r.json()
+        except (requests.ConnectionError, requests.Timeout):
+            if attempt == 3:
+                raise
+            time.sleep(2 ** attempt)  # обрыв связи: повторяем через 1, 2, 4 с
 
 
 def _table(js: dict, name: str) -> pd.DataFrame:
@@ -426,7 +433,7 @@ def add_confirmation(sig: pd.DataFrame, close: np.ndarray) -> pd.DataFrame:
 
 
 def stats(df: pd.DataFrame, sig: pd.DataFrame, horizons: list[int],
-          confirm: bool) -> tuple[pd.DataFrame, pd.DataFrame]:
+          confirm: bool) -> tuple[pd.DataFrame, pd.DataFrame, dict[int, float]]:
     close = df["close"].to_numpy(float)
     n = len(close)
 
@@ -461,7 +468,9 @@ def stats(df: pd.DataFrame, sig: pd.DataFrame, horizons: list[int],
             row[f"win% {hz}"] = 100 * (rets > 0).mean() if len(rets) else np.nan
             row[f"ср.% {hz}"] = 100 * rets.mean() if len(rets) else np.nan
         base_rows.append(row)
-    return table, pd.DataFrame(base_rows)
+    std = {hz: 100 * float(np.std(close[hz:] / close[:-hz] - 1)) if hz < n else np.nan
+           for hz in horizons}
+    return table, pd.DataFrame(base_rows), std
 
 
 # ---------------------------------------------------------------------------
@@ -472,12 +481,33 @@ def fmt_time(t: pd.Timestamp) -> str:
     return t.strftime("%Y-%m-%d") if (t.hour, t.minute) == (0, 0) else t.strftime("%Y-%m-%d %H:%M")
 
 
-def print_signals(sig: pd.DataFrame, last: int, confirm: bool, n_bars: int) -> None:
+def key_horizon(horizons: list[int]) -> int:
+    """Горизонт, по которому делается краткий вывод."""
+    return 5 if 5 in horizons else horizons[len(horizons) // 2]
+
+
+def judge(row, base: pd.DataFrame, std: dict[int, float], hz: int, min_n: int) -> tuple[str, float]:
+    """Сравнивает паттерн со случайным входом в ту же сторону.
+    Возвращает (вердикт, перевес в п.п.)."""
+    b = base[base[""] == row[""]].iloc[0]
+    edge = row[f"ср.% {hz}"] - b[f"ср.% {hz}"]
+    if row["N"] < min_n or pd.isna(edge):
+        return "мало случаев, выводов не делать", edge
+    # перевес относительно стандартной ошибки среднего: |t| >= 2 — вряд ли случайность
+    t = edge / (std[hz] / np.sqrt(row["N"])) if std[hz] > 0 else 0.0
+    if t >= 2:
+        return "работал лучше случайного входа", edge
+    if t <= -2:
+        return "работал ХУЖЕ случайного входа", edge
+    return "не лучше случайного входа", edge
+
+
+def print_signals(sig: pd.DataFrame, last: int, confirm: bool, n_bars: int, explain: bool) -> None:
     if sig.empty:
         print("Паттерны не найдены.")
         return
     tail = sig.tail(last)
-    print(f"Последние сигналы ({len(tail)} из {len(sig)}):")
+    print(f"Последние сигналы ({len(tail)} из {len(sig)} найденных за всю историю):")
     for r in tail.itertuples():
         arrow = "▲ бычий   " if r.dir > 0 else "▼ медвежий"
         line = f"  {fmt_time(r.time):<16}  {arrow}  {r.pattern:<26} ({r.kind}) close={r.close:g}"
@@ -485,47 +515,104 @@ def print_signals(sig: pd.DataFrame, last: int, confirm: bool, n_bars: int) -> N
             line += {True: "  ✓ подтверждён", False: "  ✗ не подтверждён",
                      None: "  … ждёт подтверждения"}[r.confirmed]
         print(line)
+    if explain:
+        print("""
+  Как читать:
+    дата        — свеча, на которой паттерн сформировался (его последняя свеча);
+    ▲ бычий     — паттерн предвещает рост, ▼ медвежий — падение;
+    разворот    — смена текущего тренда, продолжение — тренд, скорее всего, продолжится;
+    close       — цена закрытия этой свечи.
+  Несколько паттернов в одну дату — это одна и та же свеча, подходящая под разные модели.
+  По Нисону, свечной сигнал — предупреждение, а не приказ: дождитесь подтверждения
+  следующей свечой (ключ --confirm) и учитывайте уровни поддержки/сопротивления.""")
 
+
+def print_last_candle(sig: pd.DataFrame, n_bars: int, table: pd.DataFrame | None,
+                      base: pd.DataFrame | None, std: dict[int, float] | None,
+                      hz: int, min_n: int) -> None:
     on_last = sig[sig["i"] == n_bars - 1]
     print()
     if on_last.empty:
         print("На последней свече паттернов нет.")
-    else:
-        names = ", ".join(f"{p} ({'▲' if d > 0 else '▼'})"
-                          for p, d in zip(on_last["pattern"], on_last["dir"]))
-        print(f"На последней свече: {names}")
+        return
+    names = ", ".join(f"{p} ({'▲' if d > 0 else '▼'})"
+                      for p, d in zip(on_last["pattern"], on_last["dir"]))
+    print(f"На последней свече: {names}")
+    if table is None or table.empty:
+        return
+    for name in on_last["pattern"]:
+        row = table[table["Паттерн"] == name]
+        if row.empty:
+            continue
+        row = row.iloc[0]
+        b = base[base[""] == row[""]].iloc[0]
+        verdict, _ = judge(row, base, std, hz, min_n)
+        print(f"  {name}: в истории {row['N']} раз; через {hz} баров цена шла в сторону сигнала "
+              f"в {row[f'win% {hz}']:.0f}% случаев (случайный вход — {b[f'win% {hz}']:.0f}%), "
+              f"в среднем {row[f'ср.% {hz}']:+.2f}% (случайный — {b[f'ср.% {hz}']:+.2f}%) "
+              f"→ {verdict}.")
 
 
-def print_stats(table: pd.DataFrame, base: pd.DataFrame, horizons: list[int],
-                confirm: bool, min_n: int) -> None:
+def print_stats(table: pd.DataFrame, base: pd.DataFrame, std: dict[int, float],
+                horizons: list[int], confirm: bool, min_n: int, explain: bool) -> None:
     print()
     print("Статистика на истории (доходность в сторону сигнала, закрытие → закрытие через h баров"
           + (", вход после подтверждения" if confirm else "") + "):")
     if table.empty:
         print("  нет сигналов")
         return
-    table = table.copy()
-    rare = table["N"] < min_n
-    table.loc[rare, "Паттерн"] = table.loc[rare, "Паттерн"] + " *"
-    full = pd.concat([table, base], ignore_index=True)
+    shown = table.copy()
+    rare = shown["N"] < min_n
+    shown.loc[rare, "Паттерн"] = shown.loc[rare, "Паттерн"] + " *"
+    full = pd.concat([shown, base], ignore_index=True)
     fmts = {col: (lambda v: "" if pd.isna(v) else f"{v:6.1f}") for col in full.columns
             if col.startswith("win%")}
     fmts.update({col: (lambda v: "" if pd.isna(v) else f"{v:+6.2f}") for col in full.columns
                  if col.startswith("ср.%")})
-    text = full.to_string(index=False, formatters=fmts)
+    text = full.to_string(index=False, formatters=fmts, na_rep="")
     lines = text.splitlines()
     sep = "-" * len(lines[0])
     print(lines[0])
     print(sep)
-    for line in lines[1:len(table) + 1]:
+    for line in lines[1:len(shown) + 1]:
         print(line)
     print(sep)
-    for line in lines[len(table) + 1:]:
+    for line in lines[len(shown) + 1:]:
         print(line)
     if rare.any():
-        print(f"\n* меньше {min_n} случаев — статистика ненадёжна")
-    print("Сравнивайте win%/ср.% паттерна с бейзлайном «Любой бар» той же стороны:"
-          " преимущество есть, только если паттерн заметно лучше.")
+        print(f"* меньше {min_n} случаев — статистика ненадёжна")
+
+    hz = key_horizon(horizons)
+    if explain:
+        h_list = ", ".join(map(str, horizons))
+        print(f"""
+  Как читать таблицу:
+    N         — сколько раз паттерн встретился на истории;
+    win% h    — в скольких % случаев через h баров (h = {h_list}) цена ушла в сторону
+                сигнала: для ▲ выросла, для ▼ упала;
+    ср.% h    — средний результат сделки в сторону сигнала через h баров, в %
+                (для ▼ — как шорт: плюс означает, что цена упала);
+    Любой бар — бейзлайн: те же цифры для входа на КАЖДОМ баре без всякого паттерна.
+                Строка «лонг» — с чем сравнивать ▲, «шорт» — с чем сравнивать ▼.
+  Паттерн полезен, только если его win% и ср.% заметно лучше бейзлайна той же стороны.
+  Цифры — без учёта комиссий и проскальзывания; прошлое не гарантирует будущего.""")
+
+    print(f"\nИтог (по горизонту {hz} баров, паттерны с N ≥ {min_n}):")
+    verdicts = []
+    for _, row in table.iterrows():
+        if row["N"] < min_n:
+            continue
+        verdict, edge = judge(row, base, std, hz, min_n)
+        verdicts.append((edge, row, verdict))
+    if not verdicts:
+        print("  ни у одного паттерна недостаточно случаев — увеличьте историю (--days)")
+        return
+    for edge, row, verdict in sorted(verdicts, key=lambda x: -x[0]):
+        print(f"  {row['Паттерн'] + ' ' + row['']:<28} перевес над случайным входом "
+              f"{edge:+6.2f} п.п. → {verdict}")
+    if explain:
+        print("  «Лучше/хуже» — перевес больше двух стандартных ошибок (вряд ли случайность);"
+              " «не лучше» — разница в пределах шума.")
 
 
 # ---------------------------------------------------------------------------
@@ -550,6 +637,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--last", type=int, default=15, help="сколько последних сигналов показать")
     ap.add_argument("--min-n", type=int, default=20, help="порог «мало данных» в статистике")
     ap.add_argument("--csv", help="сохранить все сигналы в CSV")
+    ap.add_argument("--brief", action="store_true", help="без пояснений к выводу")
     args = ap.parse_args(argv)
 
     try:
@@ -587,11 +675,16 @@ def main(argv: list[str] | None = None) -> int:
     print(f"{title}: {len(df)} свечей, {fmt_time(df.index[0])} — {fmt_time(df.index[-1])}, "
           f"последнее закрытие {df['close'].iloc[-1]:g}")
     print()
-    print_signals(sig_print, args.last, args.confirm, len(df))
-
+    explain = not args.brief
+    table = base = std = None
     if args.stats:
-        table, base = stats(df, sig, horizons, args.confirm)
-        print_stats(table, base, horizons, args.confirm, args.min_n)
+        table, base, std = stats(df, sig, horizons, args.confirm)
+
+    print_signals(sig_print, args.last, args.confirm, len(df), explain)
+    if not sig.empty:
+        print_last_candle(sig, len(df), table, base, std, key_horizon(horizons), args.min_n)
+    if args.stats:
+        print_stats(table, base, std, horizons, args.confirm, args.min_n, explain)
 
     if args.csv:
         out = sig.copy()
