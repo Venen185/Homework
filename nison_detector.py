@@ -23,10 +23,13 @@
 from __future__ import annotations
 
 import argparse
+import html
+import json
 import sys
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
+from pathlib import Path
 from typing import Callable
 
 import numpy as np
@@ -531,6 +534,33 @@ SHORT_VERDICT = {
 }
 
 
+def signal_info(r, table, base, std, hz: int, min_n: int, n: int, confirm: bool) -> dict:
+    """Всё о сигнале для сводки: когда, подтверждение и как паттерн отрабатывал раньше."""
+    ago = n - 1 - r.i
+    info = {"i": int(r.i), "time": fmt_time(r.time), "dir": int(r.dir), "pattern": r.pattern,
+            "kind": r.kind, "ago": ago,
+            "when": "последняя" if ago == 0 else f"{ago} св. назад",
+            "confirmed": r.confirmed if confirm else "", "hist": None}
+    row = table[table["Паттерн"] == r.pattern] if table is not None and not table.empty else []
+    if len(row):
+        row = row.iloc[0]
+        b = base[base[""] == row[""]].iloc[0]
+        verdict, edge = judge(row, base, std, hz, min_n)
+        info["hist"] = {"N": int(row["N"]), "win": row[f"win% {hz}"], "bwin": b[f"win% {hz}"],
+                        "avg": row[f"ср.% {hz}"], "bavg": b[f"ср.% {hz}"],
+                        "verdict": SHORT_VERDICT[verdict]}
+    return info
+
+
+def hist_text(h: dict | None) -> str:
+    if not h:
+        return ""
+    if h["win"] != h["win"]:  # NaN
+        return f"N={h['N']:<4} → {h['verdict']}"
+    return (f"N={h['N']:<4} win {h['win']:3.0f}% (случ. {h['bwin']:.0f}%), "
+            f"ср. {h['avg']:+.2f}% → {h['verdict']}")
+
+
 def print_signals(sig: pd.DataFrame, last: int, confirm: bool, n_bars: int, explain: bool) -> None:
     if sig.empty:
         print("Паттерны не найдены.")
@@ -646,6 +676,383 @@ def print_stats(table: pd.DataFrame, base: pd.DataFrame, std: dict[int, float],
 
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# HTML-отчёт (один самодостаточный файл: открывается в любом браузере без интернета)
+# ---------------------------------------------------------------------------
+
+def esc(x) -> str:
+    return html.escape(str(x), quote=True)
+
+
+def fmt_price(x: float) -> str:
+    return f"{x:,.6g}".replace(",", " ") if abs(x) >= 1000 else f"{x:.6g}"
+
+
+def save_html(page: str, path: str, open_browser: bool) -> None:
+    import webbrowser
+
+    out = Path(path).resolve()
+    out.write_text(page, encoding="utf-8")
+    print(f"\nHTML-отчёт: {out}")
+    if open_browser:
+        try:
+            webbrowser.open(out.as_uri())
+        except Exception:
+            pass
+
+
+def svg_chart(df: pd.DataFrame, signals: list[dict], bars: int, width: int = 640,
+              height: int = 200) -> str:
+    """Свечной график последних `bars` свечей с отметками сигналов."""
+    tail = df.iloc[-bars:]
+    off = len(df) - len(tail)
+    pad_l, pad_r, pad_t, pad_b = 4, 58, 16, 22
+    w, h = width - pad_l - pad_r, height - pad_t - pad_b
+    lo, hi = float(tail["low"].min()), float(tail["high"].max())
+    span = (hi - lo) or abs(hi) * 0.01 or 1.0
+    lo, hi = lo - span * 0.08, hi + span * 0.08
+
+    def y(v):
+        return pad_t + (hi - v) / (hi - lo) * h
+
+    step = w / len(tail)
+    bw = max(1.0, min(9.0, step * 0.62))
+    by_bar: dict[int, list[dict]] = {}
+    for sg in signals:
+        by_bar.setdefault(sg["i"], []).append(sg)
+
+    parts = [f'<svg class="chart" viewBox="0 0 {width} {height}" role="img" '
+             f'aria-label="Свечной график, последние {len(tail)} свечей">']
+    for k in range(4):  # сетка и ценовые метки справа
+        v = lo + (hi - lo) * (k + 0.5) / 4
+        parts.append(f'<line class="grid" x1="{pad_l}" x2="{pad_l + w}" y1="{y(v):.1f}" '
+                     f'y2="{y(v):.1f}"/><text class="axis" x="{pad_l + w + 6}" '
+                     f'y="{y(v) + 4:.1f}">{esc(f"{v:.5g}")}</text>')
+    for k in (0, len(tail) // 2, len(tail) - 1):  # даты снизу
+        x = pad_l + step * (k + 0.5)
+        anchor = "start" if k == 0 else "end" if k == len(tail) - 1 else "middle"
+        parts.append(f'<text class="axis" x="{x:.1f}" y="{height - 6}" '
+                     f'text-anchor="{anchor}">{esc(fmt_time(tail.index[k]))}</text>')
+
+    for k, (ts, r) in enumerate(tail.iterrows()):
+        i = off + k
+        x = pad_l + step * (k + 0.5)
+        o, hh, ll, c = r["open"], r["high"], r["low"], r["close"]
+        cls = "up" if c >= o else "dn"
+        top, bot = y(max(o, c)), y(min(o, c))
+        sigs = by_bar.get(i, [])
+        tip = {"t": fmt_time(ts), "o": fmt_price(o), "h": fmt_price(hh), "l": fmt_price(ll),
+               "c": fmt_price(c),
+               "s": [("▲ " if sg["dir"] > 0 else "▼ ") + sg["pattern"] for sg in sigs]}
+        parts.append(
+            f'<g class="cnd {cls}" data-tip="{esc(json.dumps(tip, ensure_ascii=False))}">'
+            f'<rect class="hit" x="{x - step / 2:.1f}" y="{pad_t}" width="{step:.1f}" height="{h}"/>'
+            f'<line x1="{x:.1f}" x2="{x:.1f}" y1="{y(hh):.1f}" y2="{y(ll):.1f}"/>'
+            f'<rect class="body" x="{x - bw / 2:.1f}" y="{top:.1f}" width="{bw:.1f}" '
+            f'height="{max(1.0, bot - top):.1f}" rx="1"/></g>')
+        for n_sig, sg in enumerate(sigs[:1]):  # одна отметка на свечу
+            if sg["dir"] > 0:
+                ty = y(ll) + 6
+                pts = f"{x:.1f},{ty:.1f} {x - 5:.1f},{ty + 8:.1f} {x + 5:.1f},{ty + 8:.1f}"
+            else:
+                ty = y(hh) - 6
+                pts = f"{x:.1f},{ty:.1f} {x - 5:.1f},{ty - 8:.1f} {x + 5:.1f},{ty - 8:.1f}"
+            parts.append(f'<polygon class="mark {"up" if sg["dir"] > 0 else "dn"}" points="{pts}"/>')
+    parts.append("</svg>")
+    return "".join(parts)
+
+
+VERDICT_BADGE = {
+    "лучше случайного": ("good", "✓"),
+    "ХУЖЕ случайного": ("bad", "✗"),
+    "не лучше случайного": ("neutral", "≈"),
+    "мало случаев": ("muted", "?"),
+}
+
+
+def signal_rows_html(signals: list[dict], hz: int, confirm: bool) -> str:
+    out = []
+    for sg in reversed(signals):  # свежие сверху
+        d = "up" if sg["dir"] > 0 else "dn"
+        h = sg["hist"]
+        verdict = h["verdict"] if h else ""
+        vcls, vicon = VERDICT_BADGE.get(verdict, ("muted", ""))
+        if h and h["win"] == h["win"]:
+            hist = (f'<span class="num">{h["win"]:.0f}%</span> против '
+                    f'<span class="num">{h["bwin"]:.0f}%</span> у случайного входа · '
+                    f'ср. <span class="num">{h["avg"]:+.2f}%</span> против '
+                    f'<span class="num">{h["bavg"]:+.2f}%</span> · N={h["N"]}')
+        elif h:
+            hist = f"N={h['N']}"
+        else:
+            hist = ""
+        conf = ""
+        if confirm:
+            conf = {True: '<span class="conf ok">✓ подтверждён</span>',
+                    False: '<span class="conf no">✗ не подтверждён</span>',
+                    None: '<span class="conf wait">… ждёт подтверждения</span>'}.get(sg["confirmed"], "")
+        badge = (f'<span class="badge {vcls}">{vicon} {esc(verdict)}</span>' if verdict else "")
+        out.append(
+            f'<div class="sig" data-dir="{d}" data-verdict="{vcls}">'
+            f'<div class="sig-main"><span class="dir {d}">{"▲" if d == "up" else "▼"}</span>'
+            f'<span class="pname">{esc(sg["pattern"])}</span>'
+            f'<span class="kind">{esc(sg["kind"])}</span>{conf}</div>'
+            f'<div class="sig-meta"><span>{esc(sg["time"])} · {esc(sg["when"])}</span>{badge}</div>'
+            + (f'<div class="sig-hist">История на этом тикере через {hz} баров: {hist}</div>'
+               if hist else "")
+            + "</div>")
+    return "".join(out)
+
+
+CSS = """
+:root{color-scheme:light;--bg:#f6f6f4;--surface:#fcfcfb;--border:#e4e3df;--text:#0b0b0b;
+--text2:#52514e;--muted:#7d7c77;--grid:#ecebe7;--up:#0ca30c;--dn:#d03b3b;--accent:#2a78d6;
+--good-bg:#e3f4e3;--good:#086b08;--bad-bg:#fbe5e5;--bad:#a42727;--neu-bg:#efeeea;--neu:#52514e;
+--chip:#efeeea}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){color-scheme:dark;--bg:#121211;
+--surface:#1a1a19;--border:#2e2e2b;--text:#fff;--text2:#c3c2b7;--muted:#8f8e86;--grid:#262624;
+--up:#2fbf2f;--dn:#e66767;--accent:#3987e5;--good-bg:#173317;--good:#7fdc7f;--bad-bg:#3a1c1c;
+--bad:#f29a9a;--neu-bg:#262624;--neu:#c3c2b7;--chip:#262624}}
+:root[data-theme="dark"]{color-scheme:dark;--bg:#121211;--surface:#1a1a19;--border:#2e2e2b;
+--text:#fff;--text2:#c3c2b7;--muted:#8f8e86;--grid:#262624;--up:#2fbf2f;--dn:#e66767;
+--accent:#3987e5;--good-bg:#173317;--good:#7fdc7f;--bad-bg:#3a1c1c;--bad:#f29a9a;
+--neu-bg:#262624;--neu:#c3c2b7;--chip:#262624}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);
+font:15px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif}
+.wrap{max-width:1180px;margin:0 auto;padding:24px 16px 48px}
+h1{font-size:24px;margin:0 0 4px}
+.sub{color:var(--text2);margin:0 0 20px}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:16px}
+.tile{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:12px 16px}
+.tile .v{font-size:28px;font-weight:600;font-variant-numeric:tabular-nums}
+.tile .l{color:var(--text2);font-size:13px}
+.filters{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:0 0 16px;
+position:sticky;top:0;background:var(--bg);padding:8px 0;z-index:5}
+.filters button{border:1px solid var(--border);background:var(--surface);color:var(--text);
+border-radius:999px;padding:6px 14px;font:inherit;cursor:pointer}
+.filters button[aria-pressed="true"]{background:var(--text);color:var(--surface);border-color:var(--text)}
+.filters label{color:var(--text2);display:flex;gap:6px;align-items:center;margin-left:8px;cursor:pointer}
+.filters input[type=search]{border:1px solid var(--border);background:var(--surface);color:var(--text);
+border-radius:999px;padding:6px 14px;font:inherit;min-width:140px}
+.grid-cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,520px),1fr));gap:16px}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:16px;min-width:0}
+.card-h{display:flex;justify-content:space-between;align-items:baseline;gap:12px;flex-wrap:wrap}
+.tk{font-size:20px;font-weight:700}
+.ttl{color:var(--muted);font-size:13px}
+.price{font-variant-numeric:tabular-nums;font-size:18px;font-weight:600}
+.chg{font-size:13px;margin-left:6px;font-variant-numeric:tabular-nums}
+.chg.up{color:var(--up)}.chg.dn{color:var(--dn)}
+.chart{width:100%;height:auto;display:block;margin:8px 0 4px}
+.chart .grid{stroke:var(--grid);stroke-width:1}
+.chart .axis{fill:var(--muted);font-size:11px;font-variant-numeric:tabular-nums}
+.chart .cnd line{stroke-width:1}
+.chart .cnd.up line{stroke:var(--up)}.chart .cnd.dn line{stroke:var(--dn)}
+.chart .cnd.up .body{fill:var(--up)}.chart .cnd.dn .body{fill:var(--dn)}
+.chart .hit{fill:transparent}
+.chart .cnd:hover .hit{fill:var(--grid)}
+.chart .mark{stroke:var(--surface);stroke-width:1.5}
+.chart .mark.up{fill:var(--up)}.chart .mark.dn{fill:var(--dn)}
+.sig{border-top:1px solid var(--border);padding:10px 0}
+.sig-main{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.dir{font-weight:700}.dir.up{color:var(--up)}.dir.dn{color:var(--dn)}
+.pname{font-weight:600}
+.kind{color:var(--muted);font-size:13px}
+.sig-meta{display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;color:var(--text2);
+font-size:13px;margin-top:2px}
+.sig-hist{color:var(--text2);font-size:13px;margin-top:2px}
+.num{font-variant-numeric:tabular-nums;color:var(--text)}
+.badge{border-radius:999px;padding:1px 10px;font-size:12px;font-weight:600;white-space:nowrap}
+.badge.good{background:var(--good-bg);color:var(--good)}
+.badge.bad{background:var(--bad-bg);color:var(--bad)}
+.badge.neutral,.badge.muted{background:var(--neu-bg);color:var(--neu)}
+.conf{font-size:12px;color:var(--text2)}
+.conf.ok{color:var(--good)}.conf.no{color:var(--bad)}
+.chips{display:flex;flex-wrap:wrap;gap:6px}
+.chips span{background:var(--chip);border-radius:999px;padding:2px 10px;font-size:13px;color:var(--text2)}
+section{margin-top:28px}
+h2{font-size:17px;margin:0 0 10px}
+details{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:12px 16px;
+margin-top:28px;color:var(--text2)}
+details summary{cursor:pointer;color:var(--text);font-weight:600}
+details li{margin:4px 0}
+.err{color:var(--bad);font-size:14px}
+.empty{color:var(--text2);padding:24px;text-align:center;background:var(--surface);
+border:1px dashed var(--border);border-radius:12px}
+.tbl-wrap{overflow-x:auto}
+table{border-collapse:collapse;width:100%;font-size:13px;font-variant-numeric:tabular-nums}
+th,td{padding:6px 8px;text-align:right;border-bottom:1px solid var(--border);white-space:nowrap}
+th:first-child,td:first-child{text-align:left}
+th{color:var(--text2);font-weight:600;position:sticky;top:0;background:var(--surface)}
+tr.base td{background:var(--chip);font-weight:600}
+tr.rare td{color:var(--muted)}
+td.pos{color:var(--good)}td.neg{color:var(--bad)}
+#tip{position:fixed;pointer-events:none;background:var(--surface);color:var(--text);
+border:1px solid var(--border);border-radius:8px;padding:8px 10px;font-size:12px;
+box-shadow:0 4px 16px rgba(0,0,0,.15);display:none;z-index:10;font-variant-numeric:tabular-nums}
+#tip b{display:block;margin-bottom:2px}
+.foot{color:var(--muted);font-size:12px;margin-top:28px}
+"""
+
+JS = """
+const tip=document.getElementById('tip');
+document.addEventListener('mousemove',e=>{
+  const g=e.target.closest&&e.target.closest('.cnd');
+  if(!g){tip.style.display='none';return}
+  const d=JSON.parse(g.dataset.tip);
+  tip.innerHTML='<b>'+d.t+'</b>O '+d.o+' · H '+d.h+'<br>L '+d.l+' · C '+d.c+
+    (d.s.length?'<br>'+d.s.join('<br>'):'');
+  tip.style.display='block';
+  const x=Math.min(e.clientX+14,innerWidth-tip.offsetWidth-8);
+  const y=Math.min(e.clientY+14,innerHeight-tip.offsetHeight-8);
+  tip.style.left=x+'px';tip.style.top=y+'px';
+});
+const state={dir:'all',hideRare:false,onlyGood:false,q:''};
+function apply(){
+  let shown=0;
+  document.querySelectorAll('.card[data-ticker]').forEach(card=>{
+    let any=0;
+    card.querySelectorAll('.sig').forEach(s=>{
+      const ok=(state.dir==='all'||s.dataset.dir===state.dir)&&
+        !(state.hideRare&&s.dataset.verdict==='muted')&&
+        !(state.onlyGood&&s.dataset.verdict!=='good');
+      s.hidden=!ok;if(ok)any++;
+    });
+    const qok=!state.q||card.dataset.ticker.includes(state.q);
+    card.hidden=!(any&&qok);if(!card.hidden)shown++;
+  });
+  const em=document.getElementById('none');if(em)em.hidden=shown>0;
+}
+document.querySelectorAll('[data-f]').forEach(b=>b.addEventListener('click',()=>{
+  state.dir=b.dataset.f;
+  document.querySelectorAll('[data-f]').forEach(x=>x.setAttribute('aria-pressed',x===b));
+  apply();
+}));
+const r=document.getElementById('hideRare');if(r)r.addEventListener('change',()=>{state.hideRare=r.checked;apply()});
+const g=document.getElementById('onlyGood');if(g)g.addEventListener('change',()=>{state.onlyGood=g.checked;apply()});
+const q=document.getElementById('q');if(q)q.addEventListener('input',()=>{state.q=q.value.trim().toUpperCase();apply()});
+"""
+
+
+def help_html(hz: int, min_n: int) -> str:
+    return f"""<details><summary>Как читать отчёт</summary><ul>
+<li><b>▲ бычий</b> паттерн предвещает рост, <b>▼ медвежий</b> — падение. На графике сигнал
+отмечен треугольником под/над свечой. Наведите мышь на свечу, чтобы увидеть цены.</li>
+<li><b>Разворот</b> — возможная смена тренда, <b>продолжение</b> — тренд, скорее всего, продолжится.</li>
+<li><b>История</b> — как этот же паттерн отрабатывал раньше на этом же тикере: в скольких % случаев
+через {hz} баров цена шла в сторону сигнала и средний результат — в сравнении со входом на
+случайной свече.</li>
+<li><b>✓ лучше случайного</b> — перевес больше статистического шума; <b>≈ не лучше</b> — разница
+в пределах шума; <b>✗ хуже</b> — после паттерна цена чаще шла против него;
+<b>? мало случаев</b> — меньше {min_n}, выводов не делать.</li>
+<li>Свеча «последняя» может быть ещё не закрыта — тогда паттерн может исчезнуть до конца дня.</li>
+<li>По Нисону свечной сигнал — предупреждение, а не приказ: ждите подтверждения следующей свечой,
+смотрите на уровни поддержки/сопротивления и ставьте стоп. Цифры без комиссий;
+прошлое не гарантирует будущего.</li></ul></details>"""
+
+
+def page_html(title: str, body: str) -> str:
+    return (f'<!doctype html><html lang="ru"><head><meta charset="utf-8">'
+            f'<meta name="viewport" content="width=device-width,initial-scale=1">'
+            f'<title>{esc(title)}</title><style>{CSS}</style></head><body>'
+            f'<div class="wrap">{body}<p class="foot">Создано nison_detector.py · '
+            f'{datetime.now():%d.%m.%Y %H:%M} · данные MOEX ISS</p></div>'
+            f'<div id="tip"></div><script>{JS}</script></body></html>')
+
+
+def card_html(ticker: str, title: str, df: pd.DataFrame, signals: list[dict], hz: int,
+              confirm: bool, bars: int, width: int = 640, height: int = 200) -> str:
+    last = df["close"].iloc[-1]
+    ref = df["close"].iloc[-min(len(df), bars)]
+    chg = (last / ref - 1) * 100 if ref else 0.0
+    return (f'<article class="card" data-ticker="{esc(ticker.upper())}">'
+            f'<div class="card-h"><div><span class="tk">{esc(ticker)}</span> '
+            f'<span class="ttl">{esc(title)}</span></div>'
+            f'<div><span class="price">{esc(fmt_price(last))}</span>'
+            f'<span class="chg {"up" if chg >= 0 else "dn"}" title="изменение за период графика">'
+            f'{"▲" if chg >= 0 else "▼"} {chg:+.1f}%</span></div></div>'
+            f'{svg_chart(df, signals, bars, width, height)}'
+            f'{signal_rows_html(signals, hz, confirm)}</article>')
+
+
+def filters_html(with_search: bool) -> str:
+    return ('<div class="filters" role="toolbar" aria-label="Фильтры">'
+            '<button data-f="all" aria-pressed="true">Все</button>'
+            '<button data-f="up" aria-pressed="false">▲ Бычьи</button>'
+            '<button data-f="dn" aria-pressed="false">▼ Медвежьи</button>'
+            '<label><input type="checkbox" id="onlyGood"> только «лучше случайного»</label>'
+            '<label><input type="checkbox" id="hideRare"> скрыть «мало случаев»</label>'
+            + ('<input type="search" id="q" placeholder="Тикер…" aria-label="Поиск по тикеру">'
+               if with_search else "") + "</div>")
+
+
+def html_scan(cards: list[dict], quiet: list[str], failed: list, meta: dict) -> str:
+    n_sig = sum(len(c["signals"]) for c in cards)
+    n_up = sum(sg["dir"] > 0 for c in cards for sg in c["signals"])
+    n_good = sum(1 for c in cards for sg in c["signals"]
+                 if sg["hist"] and sg["hist"]["verdict"] == "лучше случайного")
+    tiles = [(meta["count"], "инструментов проверено"), (len(cards), "с сигналами"),
+             (n_up, "▲ бычьих сигналов"), (n_sig - n_up, "▼ медвежьих сигналов"),
+             (n_good, "✓ исторически лучше случайного")]
+    body = [f'<h1>Свечные паттерны Нисона</h1><p class="sub">{esc(meta["source"][:1].upper() + meta["source"][1:])} · '
+            f'таймфрейм {esc(meta["tf"])} · {esc(meta["period"])}</p>',
+            '<div class="tiles">' + "".join(
+                f'<div class="tile"><div class="v">{v}</div><div class="l">{esc(l)}</div></div>'
+                for v, l in tiles) + "</div>"]
+    if cards:
+        body.append(filters_html(True))
+        body.append('<div class="grid-cards">' + "".join(
+            card_html(c["ticker"], c["title"].split(",")[0], c["df"], c["signals"], meta["hz"],
+                      meta["confirm"], 60) for c in cards) + "</div>")
+        body.append('<p class="empty" id="none" hidden>Под фильтр ничего не попало.</p>')
+    else:
+        body.append('<p class="empty">Сигналов нет ни у одного инструмента за этот период.</p>')
+    if quiet:
+        body.append('<section><h2>Без сигналов</h2><div class="chips">'
+                    + "".join(f"<span>{esc(t)}</span>" for t in quiet) + "</div></section>")
+    if failed:
+        body.append('<section><h2>Не удалось загрузить</h2>' + "".join(
+            f'<p class="err">{esc(t)}: {esc(e)}</p>' for t, e in failed) + "</section>")
+    body.append(help_html(meta["hz"], meta["min_n"]))
+    return page_html(f"Паттерны Нисона — {datetime.now():%d.%m.%Y}", "".join(body))
+
+
+def stats_table_html(table: pd.DataFrame, base: pd.DataFrame, horizons: list[int],
+                     min_n: int) -> str:
+    head = "".join(f"<th>win% {h}</th><th>ср.% {h}</th>" for h in horizons)
+    rows = []
+    for cls, frame in (("", table), ("base", base)):
+        for _, r in frame.iterrows():
+            rare = cls == "" and r["N"] < min_n
+            cells = []
+            for h in horizons:
+                w, a = r[f"win% {h}"], r[f"ср.% {h}"]
+                cells.append("<td>–</td><td>–</td>" if w != w else
+                             f'<td>{w:.1f}</td><td class="{"pos" if a > 0 else "neg"}">{a:+.2f}</td>')
+            rows.append(f'<tr class="{cls}{" rare" if rare else ""}"><td>{r[""]} {esc(r["Паттерн"])}'
+                        f'{" *" if rare else ""}</td><td>{r["N"]}</td>{"".join(cells)}</tr>')
+    return (f'<div class="tbl-wrap"><table><thead><tr><th>Паттерн</th><th>N</th>{head}</tr></thead>'
+            f'<tbody>{"".join(rows)}</tbody></table></div>'
+            f'<p class="ttl">* меньше {min_n} случаев — статистика ненадёжна. Строки «Любой бар» — '
+            f'вход на каждой свече без паттерна: сравнивайте ▲ с «лонг», ▼ с «шорт».</p>')
+
+
+def html_single(df: pd.DataFrame, title: str, signals: list[dict], table, base,
+                horizons: list[int], meta: dict) -> str:
+    ticker = title.split(" ")[0]
+    body = [f'<h1>{esc(ticker)}</h1><p class="sub">{esc(title)} · {len(df)} свечей, '
+            f'{esc(fmt_time(df.index[0]))} — {esc(fmt_time(df.index[-1]))}</p>']
+    if signals:
+        body.append(filters_html(False))
+    body.append(card_html(ticker, f"последние {len(signals)} сигналов", df, signals,
+                          meta["hz"], meta["confirm"], 120, 1040, 340))
+    if table is not None and not table.empty:
+        body.append(f'<section class="card"><h2>Статистика на истории</h2>'
+                    f'{stats_table_html(table, base, horizons, meta["min_n"])}</section>')
+    body.append(help_html(meta["hz"], meta["min_n"]))
+    return page_html(f"{ticker} — паттерны Нисона", "".join(body))
+
+
 def report(df: pd.DataFrame, title: str, args, horizons: list[int]) -> None:
     """Подробный отчёт по одному инструменту."""
     sig = detect(df, args.trend_len)
@@ -673,6 +1080,14 @@ def report(df: pd.DataFrame, title: str, args, horizons: list[int]) -> None:
         out.drop(columns=["i", "dir"]).to_csv(args.csv, index=False)
         print(f"\nСигналы сохранены: {args.csv}")
 
+    if not args.no_html and not getattr(args, "_in_scan", False):
+        hz = key_horizon(horizons)
+        infos = [signal_info(r, table, base, std, hz, args.min_n, len(df), args.confirm)
+                 for r in sig.tail(args.last).itertuples()]
+        page = html_single(df, title, infos, table, base, horizons, {
+            "hz": hz, "min_n": args.min_n, "confirm": args.confirm})
+        save_html(page, args.html, not args.no_open)
+
 
 def scan(tickers: list[str], source: str, args, horizons: list[int]) -> int:
     """Сводная таблица по списку инструментов: сигналы за последние --recent дней
@@ -680,7 +1095,7 @@ def scan(tickers: list[str], source: str, args, horizons: list[int]) -> int:
     и как этот паттерн отрабатывал раньше на этом же инструменте."""
     hz = key_horizon(horizons)
     since = pd.Timestamp(date.today()) - pd.Timedelta(days=args.recent - 1)
-    rows, quiet, failed, all_sig = [], [], [], []
+    rows, quiet, failed, all_sig, cards = [], [], [], [], []
     for num, t in enumerate(tickers, 1):
         print(f"Загрузка {t} ({num}/{len(tickers)})...".ljust(40), end="\r",
               file=sys.stderr, flush=True)
@@ -698,7 +1113,8 @@ def scan(tickers: list[str], source: str, args, horizons: list[int]) -> int:
         if args.full:
             print(" " * 40, end="\r", file=sys.stderr)
             print("=" * 100)
-            report(df, title, argparse.Namespace(**{**vars(args), "stats": True, "csv": None}),
+            report(df, title, argparse.Namespace(**{**vars(args), "stats": True, "csv": None,
+                                                    "_in_scan": True}),
                    horizons)
             print()
         if args.csv:
@@ -712,24 +1128,14 @@ def scan(tickers: list[str], source: str, args, horizons: list[int]) -> int:
         if recent.empty:
             quiet.append(t)
             continue
-        for r in recent.itertuples():
-            row = table[table["Паттерн"] == r.pattern]
-            hist = ""
-            if not row.empty:
-                row = row.iloc[0]
-                b = base[base[""] == row[""]].iloc[0]
-                verdict, _ = judge(row, base, std, hz, args.min_n)
-                if row[f"win% {hz}"] == row[f"win% {hz}"]:  # не NaN
-                    hist = (f"N={row['N']:<4} win {row[f'win% {hz}']:3.0f}% "
-                            f"(случ. {b[f'win% {hz}']:.0f}%), ср. {row[f'ср.% {hz}']:+.2f}% "
-                            f"→ {SHORT_VERDICT[verdict]}")
-                else:
-                    hist = f"N={row['N']:<4} → {SHORT_VERDICT[verdict]}"
-            ago = n - 1 - r.i
-            when = "последняя" if ago == 0 else f"{ago} св. назад"
-            conf = {True: "✓", False: "✗", None: "…"}[r.confirmed] if args.confirm else ""
-            rows.append((t, df["close"].iloc[-1], fmt_time(r.time), when,
-                         ("▲ " if r.dir > 0 else "▼ ") + r.pattern, conf, hist))
+        infos = [signal_info(r, table, base, std, hz, args.min_n, n, args.confirm)
+                 for r in recent.itertuples()]
+        cards.append({"ticker": t, "title": title, "df": df, "signals": infos})
+        for info in infos:
+            conf = {True: "✓", False: "✗", None: "…", "": ""}[info["confirmed"]]
+            rows.append((t, df["close"].iloc[-1], info["time"], info["when"],
+                         ("▲ " if info["dir"] > 0 else "▼ ") + info["pattern"], conf,
+                         hist_text(info["hist"])))
     print(" " * 40, end="\r", file=sys.stderr)
 
     if args.full:
@@ -774,6 +1180,14 @@ def scan(tickers: list[str], source: str, args, horizons: list[int]) -> int:
         out["direction"] = np.where(out["dir"] > 0, "bull", "bear")
         out.drop(columns=["i", "dir"]).to_csv(args.csv, index=False)
         print(f"\nСигналы сохранены: {args.csv}")
+
+    if not args.no_html:
+        period = (f"сигналы на последних {args.bars} свечах" if args.bars
+                  else f"сигналы за последние {args.recent} дн. (с {since:%d.%m.%Y})")
+        page = html_scan(cards, quiet, failed, {
+            "source": source, "count": len(tickers), "tf": args.tf, "period": period,
+            "hz": hz, "min_n": args.min_n, "confirm": args.confirm})
+        save_html(page, args.html, not args.no_open)
     return 0 if len(failed) < len(tickers) else 1
 
 
@@ -806,6 +1220,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--min-n", type=int, default=20, help="порог «мало данных» в статистике")
     ap.add_argument("--csv", help="сохранить все сигналы в CSV")
     ap.add_argument("--brief", action="store_true", help="без пояснений к выводу")
+    ap.add_argument("--html", default="nison_report.html",
+                    help="куда сохранить HTML-отчёт (по умолчанию nison_report.html)")
+    ap.add_argument("--no-html", action="store_true", help="не создавать HTML-отчёт")
+    ap.add_argument("--no-open", action="store_true", help="не открывать отчёт в браузере")
     args = ap.parse_args(argv)
 
     try:

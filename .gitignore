@@ -1,0 +1,4 @@
+# детектор паттернов Нисона
+.venv/
+__pycache__/
+nison_report.html
