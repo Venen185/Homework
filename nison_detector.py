@@ -12,7 +12,8 @@
     python nison_detector.py SiZ6 --futures         конкретный контракт
     python nison_detector.py GAZP --tf 4h --last 30 --confirm --csv gazp.csv
     python nison_detector.py SBER GAZP LKOH         свой список, сводная таблица
-    python nison_detector.py --bars 5 --full        голубые фишки, сигналы за 5 свечей + отчёты
+    python nison_detector.py --recent 14 --full     голубые фишки, сигналы за 14 дней + отчёты
+    python nison_detector.py --bars 3               сигналы на 3 последних свечах вместо дней
 
 Нисон подчёркивает: разворотная модель имеет смысл только при наличии тренда,
 который можно развернуть, поэтому все разворотные паттерны проверяются
@@ -674,9 +675,11 @@ def report(df: pd.DataFrame, title: str, args, horizons: list[int]) -> None:
 
 
 def scan(tickers: list[str], source: str, args, horizons: list[int]) -> int:
-    """Сводная таблица по списку инструментов: сигналы на последних --bars свечах
+    """Сводная таблица по списку инструментов: сигналы за последние --recent дней
+    (или на последних --bars свечах)
     и как этот паттерн отрабатывал раньше на этом же инструменте."""
     hz = key_horizon(horizons)
+    since = pd.Timestamp(date.today()) - pd.Timedelta(days=args.recent - 1)
     rows, quiet, failed, all_sig = [], [], [], []
     for num, t in enumerate(tickers, 1):
         print(f"Загрузка {t} ({num}/{len(tickers)})...".ljust(40), end="\r",
@@ -702,7 +705,10 @@ def scan(tickers: list[str], source: str, args, horizons: list[int]) -> int:
             all_sig.append(sig.assign(ticker=t))
 
         n = len(df)
-        recent = sig[sig["i"] >= n - args.bars]
+        if args.bars:
+            recent = sig[sig["i"] >= n - args.bars]
+        else:
+            recent = sig[sig["time"] >= since]
         if recent.empty:
             quiet.append(t)
             continue
@@ -729,7 +735,8 @@ def scan(tickers: list[str], source: str, args, horizons: list[int]) -> int:
     if args.full:
         print("=" * 100)
     print(f"Сводка ({source}), инструментов: {len(tickers)}, таймфрейм {args.tf}, "
-          f"сигналы на последних {args.bars} свечах")
+          + (f"сигналы на последних {args.bars} свечах" if args.bars
+             else f"сигналы за последние {args.recent} дн. (с {since:%Y-%m-%d})"))
     print()
     if rows:
         conf_col = "Подтв. " if args.confirm else ""
@@ -790,8 +797,10 @@ def main(argv: list[str] | None = None) -> int:
                     help="учитывать подтверждение следующей свечой (по Нисону)")
     ap.add_argument("--trend-len", type=int, default=10, help="баров для определения тренда")
     ap.add_argument("--last", type=int, default=15, help="сколько последних сигналов показать")
-    ap.add_argument("--bars", type=int, default=3,
-                    help="сводка: сигналы на скольких последних свечах показывать (по умолчанию 3)")
+    ap.add_argument("--recent", type=int, default=7,
+                    help="сводка: сигналы за сколько последних календарных дней (по умолчанию 7)")
+    ap.add_argument("--bars", type=int,
+                    help="сводка: вместо дней — сигналы на N последних свечах")
     ap.add_argument("--full", action="store_true",
                     help="сводка: дополнительно подробный отчёт по каждому тикеру")
     ap.add_argument("--min-n", type=int, default=20, help="порог «мало данных» в статистике")
@@ -805,8 +814,8 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError
     except ValueError:
         ap.error("--horizons: список положительных целых, напр. 1,3,5,10")
-    if args.bars < 1:
-        ap.error("--bars должен быть >= 1")
+    if args.recent < 1 or (args.bars is not None and args.bars < 1):
+        ap.error("--recent и --bars должны быть >= 1")
 
     if args.demo:
         args.stats = True
