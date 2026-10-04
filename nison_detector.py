@@ -5,11 +5,14 @@
 Данные берутся из открытого API MOEX ISS (без ключа и регистрации).
 
 Примеры:
+    python nison_detector.py                        15 голубых фишек MOEX, сводная таблица
     python nison_detector.py --demo                 проверка без интернета (синтетика)
     python nison_detector.py SBER --stats           акция, дневки + статистика на истории
     python nison_detector.py Si --futures --tf 1h   фьючерс (ближайший контракт), часовики
     python nison_detector.py SiZ6 --futures         конкретный контракт
     python nison_detector.py GAZP --tf 4h --last 30 --confirm --csv gazp.csv
+    python nison_detector.py SBER GAZP LKOH         свой список, сводная таблица
+    python nison_detector.py --bars 5 --full        голубые фишки, сигналы за 5 свечей + отчёты
 
 Нисон подчёркивает: разворотная модель имеет смысл только при наличии тренда,
 который можно развернуть, поэтому все разворотные паттерны проверяются
@@ -41,6 +44,10 @@ TIMEFRAMES = {
     "1M": (31, 9000),
 }
 
+# Запасной состав индекса голубых фишек MOEXBC (если не удалось получить его с биржи)
+BLUE_CHIPS = ["SBER", "GAZP", "LKOH", "YDEX", "T", "ROSN", "NVTK", "GMKN",
+              "TATN", "PLZL", "CHMF", "NLMK", "MTSS", "VTBR", "X5"]
+
 # Пороговые коэффициенты (в долях среднего тела / диапазона свечи)
 LONG_BODY = 1.2    # «длинное» тело: >= 1.2 * среднего тела
 SMALL_BODY = 0.5   # «маленькое» тело: <= 0.5 * среднего тела
@@ -70,6 +77,19 @@ def _iss_get(path: str, params: dict) -> dict:
 def _table(js: dict, name: str) -> pd.DataFrame:
     block = js.get(name) or {}
     return pd.DataFrame(block.get("data", []), columns=block.get("columns", []))
+
+
+def blue_chips() -> tuple[list[str], str]:
+    """Текущий состав индекса голубых фишек MOEXBC с биржи, иначе встроенный список."""
+    try:
+        js = _iss_get("statistics/engines/stock/markets/index/analytics/MOEXBC.json",
+                      {"limit": 100})
+        tickers = _table(js, "analytics")["ticker"].dropna().astype(str).unique().tolist()
+        if len(tickers) >= 10:
+            return tickers, "состав индекса MOEXBC с биржи"
+    except Exception:
+        pass
+    return BLUE_CHIPS, "встроенный список (состав индекса получить не удалось)"
 
 
 def resolve_futures(code: str) -> str:
@@ -502,6 +522,14 @@ def judge(row, base: pd.DataFrame, std: dict[int, float], hz: int, min_n: int) -
     return "не лучше случайного входа", edge
 
 
+SHORT_VERDICT = {
+    "работал лучше случайного входа": "лучше случайного",
+    "работал ХУЖЕ случайного входа": "ХУЖЕ случайного",
+    "не лучше случайного входа": "не лучше случайного",
+    "мало случаев, выводов не делать": "мало случаев",
+}
+
+
 def print_signals(sig: pd.DataFrame, last: int, confirm: bool, n_bars: int, explain: bool) -> None:
     if sig.empty:
         print("Паттерны не найдены.")
@@ -617,60 +645,12 @@ def print_stats(table: pd.DataFrame, base: pd.DataFrame, std: dict[int, float],
 
 # ---------------------------------------------------------------------------
 
-def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(
-        description="Свечные паттерны Нисона на данных Московской биржи (MOEX ISS).",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__.split("Примеры:")[1].split("Нисон")[0] if __doc__ else None,
-    )
-    ap.add_argument("ticker", nargs="?", help="тикер акции (SBER) или фьючерса (Si, RTS, SiZ6)")
-    ap.add_argument("--demo", action="store_true", help="синтетические данные, без интернета")
-    ap.add_argument("--futures", action="store_true", help="срочный рынок FORTS")
-    ap.add_argument("--board", default="TQBR", help="режим торгов для акций (по умолчанию TQBR)")
-    ap.add_argument("--tf", default="1d", choices=list(TIMEFRAMES), help="таймфрейм (по умолчанию 1d)")
-    ap.add_argument("--days", type=int, help="глубина истории в днях")
-    ap.add_argument("--stats", action="store_true", help="статистика отработки паттернов на истории")
-    ap.add_argument("--horizons", default="1,3,5,10", help="горизонты статистики в барах")
-    ap.add_argument("--confirm", action="store_true",
-                    help="учитывать подтверждение следующей свечой (по Нисону)")
-    ap.add_argument("--trend-len", type=int, default=10, help="баров для определения тренда")
-    ap.add_argument("--last", type=int, default=15, help="сколько последних сигналов показать")
-    ap.add_argument("--min-n", type=int, default=20, help="порог «мало данных» в статистике")
-    ap.add_argument("--csv", help="сохранить все сигналы в CSV")
-    ap.add_argument("--brief", action="store_true", help="без пояснений к выводу")
-    args = ap.parse_args(argv)
-
-    try:
-        horizons = sorted({int(x) for x in args.horizons.split(",") if x.strip()})
-        if not horizons or min(horizons) < 1:
-            raise ValueError
-    except ValueError:
-        ap.error("--horizons: список положительных целых, напр. 1,3,5,10")
-
-    if args.demo:
-        df, title = demo_data(), "DEMO (синтетика), 1d"
-        args.stats = True
-    elif args.ticker:
-        try:
-            df, title = load_moex(args.ticker, args.futures, args.tf, args.days, args.board)
-        except Exception as e:  # сеть, неверный тикер и т.п.
-            print(f"Ошибка загрузки данных MOEX: {e}", file=sys.stderr)
-            print("Проверьте тикер и доступ к iss.moex.com, или запустите --demo.", file=sys.stderr)
-            return 1
-    else:
-        ap.error("укажите тикер или --demo")
-
-    if len(df) < 30:
-        print(f"Слишком мало свечей ({len(df)}) для анализа.", file=sys.stderr)
-        return 1
-
+def report(df: pd.DataFrame, title: str, args, horizons: list[int]) -> None:
+    """Подробный отчёт по одному инструменту."""
     sig = detect(df, args.trend_len)
     if args.confirm or args.stats:
         sig = add_confirmation(sig, df["close"].to_numpy(float))
-    if not args.confirm and "confirmed" in sig:
-        sig_print = sig.drop(columns="confirmed")
-    else:
-        sig_print = sig
+    sig_print = sig.drop(columns="confirmed") if not args.confirm and "confirmed" in sig else sig
 
     print(f"{title}: {len(df)} свечей, {fmt_time(df.index[0])} — {fmt_time(df.index[-1])}, "
           f"последнее закрытие {df['close'].iloc[-1]:g}")
@@ -691,7 +671,168 @@ def main(argv: list[str] | None = None) -> int:
         out["direction"] = np.where(out["dir"] > 0, "bull", "bear")
         out.drop(columns=["i", "dir"]).to_csv(args.csv, index=False)
         print(f"\nСигналы сохранены: {args.csv}")
-    return 0
+
+
+def scan(tickers: list[str], source: str, args, horizons: list[int]) -> int:
+    """Сводная таблица по списку инструментов: сигналы на последних --bars свечах
+    и как этот паттерн отрабатывал раньше на этом же инструменте."""
+    hz = key_horizon(horizons)
+    rows, quiet, failed, all_sig = [], [], [], []
+    for num, t in enumerate(tickers, 1):
+        print(f"Загрузка {t} ({num}/{len(tickers)})...".ljust(40), end="\r",
+              file=sys.stderr, flush=True)
+        try:
+            df, title = load_moex(t, args.futures, args.tf, args.days, args.board)
+        except Exception as e:
+            failed.append((t, str(e).splitlines()[0][:80]))
+            continue
+        if len(df) < 30:
+            failed.append((t, f"мало свечей ({len(df)})"))
+            continue
+
+        sig = add_confirmation(detect(df, args.trend_len), df["close"].to_numpy(float))
+        table, base, std = stats(df, sig, horizons, args.confirm)
+        if args.full:
+            print(" " * 40, end="\r", file=sys.stderr)
+            print("=" * 100)
+            report(df, title, argparse.Namespace(**{**vars(args), "stats": True, "csv": None}),
+                   horizons)
+            print()
+        if args.csv:
+            all_sig.append(sig.assign(ticker=t))
+
+        n = len(df)
+        recent = sig[sig["i"] >= n - args.bars]
+        if recent.empty:
+            quiet.append(t)
+            continue
+        for r in recent.itertuples():
+            row = table[table["Паттерн"] == r.pattern]
+            hist = ""
+            if not row.empty:
+                row = row.iloc[0]
+                b = base[base[""] == row[""]].iloc[0]
+                verdict, _ = judge(row, base, std, hz, args.min_n)
+                if row[f"win% {hz}"] == row[f"win% {hz}"]:  # не NaN
+                    hist = (f"N={row['N']:<4} win {row[f'win% {hz}']:3.0f}% "
+                            f"(случ. {b[f'win% {hz}']:.0f}%), ср. {row[f'ср.% {hz}']:+.2f}% "
+                            f"→ {SHORT_VERDICT[verdict]}")
+                else:
+                    hist = f"N={row['N']:<4} → {SHORT_VERDICT[verdict]}"
+            ago = n - 1 - r.i
+            when = "последняя" if ago == 0 else f"{ago} св. назад"
+            conf = {True: "✓", False: "✗", None: "…"}[r.confirmed] if args.confirm else ""
+            rows.append((t, df["close"].iloc[-1], fmt_time(r.time), when,
+                         ("▲ " if r.dir > 0 else "▼ ") + r.pattern, conf, hist))
+    print(" " * 40, end="\r", file=sys.stderr)
+
+    if args.full:
+        print("=" * 100)
+    print(f"Сводка ({source}), инструментов: {len(tickers)}, таймфрейм {args.tf}, "
+          f"сигналы на последних {args.bars} свечах")
+    print()
+    if rows:
+        conf_col = "Подтв. " if args.confirm else ""
+        print(f"{'Тикер':<7}{'Цена':>10}  {'Свеча':<17}{'Когда':<13}{'Сигнал':<30}{conf_col}"
+              f"История на этом тикере (через {hz} баров)")
+        print("-" * 130)
+        prev = None
+        for t, price, ts, when, name, conf, hist in rows:
+            head = f"{t:<7}{price:>10g}" if t != prev else " " * 17
+            conf_txt = f"{conf:<7}" if args.confirm else ""
+            print(f"{head}  {ts:<17}{when:<13}{name:<30}{conf_txt}{hist}")
+            prev = t
+    else:
+        print("Сигналов нет ни у одного инструмента.")
+    if quiet:
+        print(f"\nБез сигналов: {', '.join(quiet)}")
+    for t, err in failed:
+        print(f"Не удалось загрузить {t}: {err}")
+
+    if not args.brief and rows:
+        print(f"""
+  Как читать:
+    Цена      — последнее закрытие; Свеча — дата свечи, на которой сформировался паттерн;
+    Когда     — «последняя» = самая свежая свеча (если торги ещё идут, она не закрыта
+                и паттерн может исчезнуть), «N св. назад» — сколько свечей прошло;
+    История   — как этот паттерн отрабатывал раньше на ЭТОМ ЖЕ тикере: N — сколько раз встречался,
+                в скольких % случаев через {hz} баров цена ушла в сторону сигнала, сравнение
+                со входом на случайной свече («случ.») и средний результат в %.
+    Вывод «лучше случайного» — перевес больше статистического шума; «мало случаев» — меньше
+    {args.min_n} раз, выводов не делать. Сигнал — повод посмотреть график, а не приказ на вход.
+  Подробный отчёт по одному тикеру: python nison_detector.py SBER --stats""")
+
+    if args.csv and all_sig:
+        out = pd.concat(all_sig, ignore_index=True)
+        out["direction"] = np.where(out["dir"] > 0, "bull", "bear")
+        out.drop(columns=["i", "dir"]).to_csv(args.csv, index=False)
+        print(f"\nСигналы сохранены: {args.csv}")
+    return 0 if len(failed) < len(tickers) else 1
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(
+        description="Свечные паттерны Нисона на данных Московской биржи (MOEX ISS).",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__.split("Примеры:")[1].split("Нисон")[0] if __doc__ else None,
+    )
+    ap.add_argument("tickers", nargs="*",
+                    help="тикер(ы) акций (SBER) или фьючерсов (Si, RTS, SiZ6); "
+                         "без тикера — 15 голубых фишек")
+    ap.add_argument("--demo", action="store_true", help="синтетические данные, без интернета")
+    ap.add_argument("--futures", action="store_true", help="срочный рынок FORTS")
+    ap.add_argument("--board", default="TQBR", help="режим торгов для акций (по умолчанию TQBR)")
+    ap.add_argument("--tf", default="1d", choices=list(TIMEFRAMES), help="таймфрейм (по умолчанию 1d)")
+    ap.add_argument("--days", type=int, help="глубина истории в днях")
+    ap.add_argument("--stats", action="store_true", help="статистика отработки паттернов на истории")
+    ap.add_argument("--horizons", default="1,3,5,10", help="горизонты статистики в барах")
+    ap.add_argument("--confirm", action="store_true",
+                    help="учитывать подтверждение следующей свечой (по Нисону)")
+    ap.add_argument("--trend-len", type=int, default=10, help="баров для определения тренда")
+    ap.add_argument("--last", type=int, default=15, help="сколько последних сигналов показать")
+    ap.add_argument("--bars", type=int, default=3,
+                    help="сводка: сигналы на скольких последних свечах показывать (по умолчанию 3)")
+    ap.add_argument("--full", action="store_true",
+                    help="сводка: дополнительно подробный отчёт по каждому тикеру")
+    ap.add_argument("--min-n", type=int, default=20, help="порог «мало данных» в статистике")
+    ap.add_argument("--csv", help="сохранить все сигналы в CSV")
+    ap.add_argument("--brief", action="store_true", help="без пояснений к выводу")
+    args = ap.parse_args(argv)
+
+    try:
+        horizons = sorted({int(x) for x in args.horizons.split(",") if x.strip()})
+        if not horizons or min(horizons) < 1:
+            raise ValueError
+    except ValueError:
+        ap.error("--horizons: список положительных целых, напр. 1,3,5,10")
+    if args.bars < 1:
+        ap.error("--bars должен быть >= 1")
+
+    if args.demo:
+        args.stats = True
+        report(demo_data(), "DEMO (синтетика), 1d", args, horizons)
+        return 0
+
+    if len(args.tickers) == 1:
+        try:
+            df, title = load_moex(args.tickers[0], args.futures, args.tf, args.days, args.board)
+        except Exception as e:  # сеть, неверный тикер и т.п.
+            print(f"Ошибка загрузки данных MOEX: {e}", file=sys.stderr)
+            print("Проверьте тикер и доступ к iss.moex.com, или запустите --demo.", file=sys.stderr)
+            return 1
+        if len(df) < 30:
+            print(f"Слишком мало свечей ({len(df)}) для анализа.", file=sys.stderr)
+            return 1
+        report(df, title, args, horizons)
+        return 0
+
+    if args.tickers:
+        return scan([t.upper() if not args.futures else t for t in args.tickers],
+                    "заданный список", args, horizons)
+    if args.futures:
+        ap.error("для фьючерсов укажите тикер(ы), напр.: Si RTS BR --futures")
+    tickers, source = blue_chips()
+    return scan(tickers, source, args, horizons)
 
 
 if __name__ == "__main__":
